@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 import base64
 
 app = Flask(__name__)
@@ -22,11 +21,9 @@ def decrypt():
         cipher = AES.new(key, AES.MODE_CBC, iv)
         decrypted = cipher.decrypt(encrypted_data)
         
-        # Remove padding
-        try:
-            decrypted = unpad(decrypted, AES.block_size)
-        except:
-            pass  # Alguns vídeos não têm padding
+        # WhatsApp não usa padding padrão, então não fazemos unpad
+        # Apenas remove possíveis bytes nulos do final
+        decrypted = decrypted.rstrip(b'\x00')
         
         return jsonify({
             'decryptedData': base64.b64encode(decrypted).decode('utf-8')
