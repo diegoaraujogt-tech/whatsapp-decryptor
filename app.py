@@ -1,34 +1,23 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
 import base64
 import hashlib
 import hmac as hmac_module
 import requests
-import tempfile
 import os
 import sys
 
 app = Flask(__name__)
 
-# WhatsApp media type info strings for HKDF key expansion
 APP_INFO = {
     "video": b"WhatsApp Video Keys",
     "image": b"WhatsApp Image Keys",
     "audio": b"WhatsApp Audio Keys",
     "document": b"WhatsApp Document Keys",
-    "video/mp4": b"WhatsApp Video Keys",
-    "image/jpeg": b"WhatsApp Image Keys",
-    "image/webp": b"WhatsApp Image Keys",
-    "image/png": b"WhatsApp Image Keys",
-    "audio/aac": b"WhatsApp Audio Keys",
-    "audio/ogg": b"WhatsApp Audio Keys",
-    "audio/wav": b"WhatsApp Audio Keys",
-    "application/pdf": b"WhatsApp Document Keys",
 }
 
 
 def hkdf_expand(key, length, app_info=b""):
-    """HKDF key derivation as used by WhatsApp"""
     key = hmac_module.new(b"\0" * 32, key, hashlib.sha256).digest()
     key_stream = b""
     key_block = b""
@@ -45,7 +34,6 @@ def hkdf_expand(key, length, app_info=b""):
 
 
 def aes_unpad(s):
-    """Remove PKCS7 padding"""
     if len(s) == 0:
         return s
     pad_len = s[-1]
@@ -57,38 +45,32 @@ def aes_unpad(s):
 
 
 def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
-    """Decrypt WhatsApp media using HKDF-based algorithm"""
     info = APP_INFO.get(media_type, b"WhatsApp Video Keys")
     media_key_expanded = hkdf_expand(media_key_bytes, 112, info)
-
     iv = media_key_expanded[:16]
     cipher_key = media_key_expanded[16:48]
-
-    # Last 10 bytes are MAC
     file_data = encrypted_data[:-10]
-
     cipher = AES.new(cipher_key, AES.MODE_CBC, iv)
     decrypted = cipher.decrypt(file_data)
     decrypted = aes_unpad(decrypted)
-
     return decrypted
 
 
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v2 (URL mode)'
+    return 'WhatsApp Decryptor OK - v3 (URL+base64)'
 
 
 @app.route('/decrypt-url', methods=['POST'])
 def decrypt_url():
-    """Downloads .enc file from WhatsApp URL and returns decrypted binary file"""
+    """Downloads .enc from WhatsApp URL, decrypts, returns base64 JSON"""
     try:
         data = request.json
         file_url = data.get('url', '')
         media_key_b64 = data.get('mediaKey', '')
         media_type = data.get('mediaType', 'video')
 
-        print(f"=== DECRYPT-URL REQUEST ===", file=sys.stderr)
+        print(f"=== DECRYPT-URL v3 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
 
@@ -103,7 +85,7 @@ def decrypt_url():
 
         # Download encrypted file from WhatsApp CDN
         print(f"Downloading from WhatsApp CDN...", file=sys.stderr)
-        resp = requests.get(file_url, timeout=120)
+        resp = requests.get(file_url, timeout=300)
         resp.raise_for_status()
 
         encrypted_data = resp.content
@@ -116,42 +98,20 @@ def decrypt_url():
         decrypted = decrypt_media(encrypted_data, media_key_bytes, media_type)
         print(f"Decrypted {len(decrypted)} bytes", file=sys.stderr)
 
-        # Write to temp file and send as binary response
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.dec')
-        tmp.write(decrypted)
-        tmp.close()
+        # Return base64 encoded
+        decrypted_b64 = base64.b64encode(decrypted).decode('utf-8')
+        print(f"Base64 length: {len(decrypted_b64)}", file=sys.stderr)
 
-        # Determine mime type
-        mime_map = {
-            'video': 'video/mp4',
-            'image': 'image/jpeg',
-            'audio': 'audio/ogg',
-            'document': 'application/octet-stream',
-        }
-        mime = mime_map.get(media_type, 'application/octet-stream')
-
-        response = send_file(
-            tmp.name,
-            mimetype=mime,
-            as_attachment=True,
-            download_name=f'decrypted.{media_type}'
-        )
-
-        # Clean up temp file after sending
-        @response.call_on_close
-        def cleanup():
-            try:
-                os.unlink(tmp.name)
-            except:
-                pass
-
-        return response
+        return jsonify({
+            'decryptedData': decrypted_b64,
+            'size': len(decrypted)
+        })
 
     except requests.exceptions.RequestException as e:
         print(f"DOWNLOAD ERROR: {str(e)}", file=sys.stderr)
-        return jsonify({'error': f'Failed to download file: {str(e)}'}), 500
+        return jsonify({'error': f'Failed to download: {str(e)}'}), 500
     except Exception as e:
-        print(f"ERROR in /decrypt-url: {str(e)}", file=sys.stderr)
+        print(f"ERROR: {str(e)}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
         return jsonify({'error': str(e)}), 500
