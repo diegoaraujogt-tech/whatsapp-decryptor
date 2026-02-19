@@ -1,13 +1,9 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from Crypto.Cipher import AES
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
 import base64
 import hashlib
 import hmac as hmac_module
 import requests
-import json
 import os
 import sys
 
@@ -60,78 +56,29 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     return decrypted
 
 
-def get_drive_service():
-    creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
-    if not creds_json:
-        raise Exception('GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set')
-
-    try:
-        creds_dict = json.loads(creds_json)
-    except json.JSONDecodeError as e:
-        raise Exception(f'Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON: {str(e)}')
-
-    # Fix escaped newlines in private_key
-    if 'private_key' in creds_dict:
-        pk = creds_dict['private_key']
-        # Handle double-escaped newlines from env vars
-        pk = pk.replace('\\n', '\n')
-        # Ensure it starts and ends properly
-        if not pk.startswith('-----BEGIN'):
-            raise Exception(f'private_key does not start with BEGIN marker. First 50 chars: {pk[:50]}')
-        creds_dict['private_key'] = pk
-
-    credentials = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=['https://www.googleapis.com/auth/drive.file']
-    )
-    return build('drive', 'v3', credentials=credentials)
-
-
-def upload_to_drive(file_data, file_name, mime_type, folder_id):
-    service = get_drive_service()
-    file_metadata = {
-        'name': file_name,
-        'parents': [folder_id]
-    }
-    media = MediaInMemoryUpload(file_data, mimetype=mime_type, resumable=True)
-    file = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id, name, webViewLink, size'
-    ).execute()
-    return file
-
-
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v4.1 (Direct Drive Upload)'
+    return 'WhatsApp Decryptor OK - v5.0 (Decrypt Only)'
 
 
-@app.route('/decrypt-and-upload', methods=['POST'])
-def decrypt_and_upload():
+@app.route('/decrypt-and-return', methods=['POST'])
+def decrypt_and_return():
+    """Decripta e retorna o arquivo em base64 para o N8N fazer upload"""
     try:
         data = request.json
         file_url = data.get('url', '')
         media_key_b64 = data.get('mediaKey', '')
         media_type = data.get('mediaType', 'video')
-        file_name = data.get('fileName', 'video.mp4')
-        folder_id = data.get('folderId', '')
-        mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-UPLOAD v4.1 ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-RETURN v5.0 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
-        print(f"FileName: {file_name}", file=sys.stderr)
-        print(f"FolderID: {folder_id}", file=sys.stderr)
-        print(f"MediaKey: {media_key_b64}", file=sys.stderr)
         print(f"MediaKey length: {len(media_key_b64)} chars", file=sys.stderr)
 
         if not file_url:
             return jsonify({'error': 'url is required'}), 400
         if not media_key_b64:
             return jsonify({'error': 'mediaKey is required'}), 400
-        if not folder_id:
-            return jsonify({'error': 'folderId is required'}), 400
 
         # Decode mediaKey with padding fix
         try:
@@ -156,8 +103,11 @@ def decrypt_and_upload():
         encrypted_data = resp.content
         print(f"Downloaded {len(encrypted_data)} bytes", file=sys.stderr)
 
-        if len(encrypted_data) < 11:
-            return jsonify({'error': f'File too small: {len(encrypted_data)} bytes'}), 400
+        if len(encrypted_data) < 100:
+            return jsonify({
+                'error': f'File too small ({len(encrypted_data)} bytes) - URL may have expired',
+                'response_preview': encrypted_data[:200].decode('utf-8', errors='replace')
+            }), 400
 
         # Step 2: Decrypt
         print(f"Step 2: Decrypting...", file=sys.stderr)
@@ -165,25 +115,15 @@ def decrypt_and_upload():
         print(f"Decrypted {len(decrypted)} bytes", file=sys.stderr)
         del encrypted_data
 
-        # Step 3: Upload
-        print(f"Step 3: Uploading to Drive...", file=sys.stderr)
-        try:
-            drive_file = upload_to_drive(decrypted, file_name, mime_type, folder_id)
-        except Exception as e:
-            print(f"DRIVE ERROR: {str(e)}", file=sys.stderr)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            return jsonify({'error': f'Drive upload failed: {str(e)}'}), 500
-
-        print(f"Done! File ID: {drive_file.get('id')}", file=sys.stderr)
+        # Step 3: Return base64
+        decrypted_b64 = base64.b64encode(decrypted).decode('utf-8')
         del decrypted
+        print(f"Returning {len(decrypted_b64)} base64 chars", file=sys.stderr)
 
         return jsonify({
             'success': True,
-            'fileId': drive_file.get('id'),
-            'fileName': drive_file.get('name'),
-            'fileLink': drive_file.get('webViewLink'),
-            'fileSize': drive_file.get('size')
+            'decryptedData': decrypted_b64,
+            'size': len(decrypted_b64)
         })
 
     except requests.exceptions.RequestException as e:
@@ -194,6 +134,12 @@ def decrypt_and_upload():
         import traceback
         traceback.print_exc(file=sys.stderr)
         return jsonify({'error': str(e)}), 500
+
+
+# Mantém a rota antiga caso queira usar depois
+@app.route('/decrypt-and-upload', methods=['POST'])
+def decrypt_and_upload():
+    return jsonify({'error': 'Route disabled. Use /decrypt-and-return instead.'}), 400
 
 
 if __name__ == '__main__':
