@@ -1,4 +1,5 @@
 @app.route('/decrypt-and-return', methods=['POST'])
+from flask import Flask, request, jsonify, Response
 def decrypt_and_return():
     """Decripta e retorna o arquivo como bytes raw"""
     try:
