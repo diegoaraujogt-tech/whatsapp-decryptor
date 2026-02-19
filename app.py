@@ -1,9 +1,13 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 import base64
 import hashlib
 import hmac as hmac_module
 import requests
+import json
 import os
 import sys
 
@@ -56,28 +60,70 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     return decrypted
 
 
+def get_drive_service():
+    creds_b64 = os.environ.get('GOOGLE_SERVICE_ACCOUNT_B64', '')
+    if creds_b64:
+        creds_json = base64.b64decode(creds_b64).decode('utf-8')
+        creds_dict = json.loads(creds_json)
+    else:
+        creds_raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+        if not creds_raw:
+            raise Exception('No service account credentials found')
+        creds_dict = json.loads(creds_raw)
+
+    if 'private_key' in creds_dict:
+        creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
+
+    credentials = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=['https://www.googleapis.com/auth/drive.file']
+    )
+    return build('drive', 'v3', credentials=credentials)
+
+
+def upload_to_drive(file_data, file_name, mime_type, folder_id):
+    service = get_drive_service()
+    file_metadata = {
+        'name': file_name,
+        'parents': [folder_id]
+    }
+    media = MediaInMemoryUpload(file_data, mimetype=mime_type, resumable=True)
+    file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, name, webViewLink, size'
+    ).execute()
+    return file
+
+
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v5.1 (Binary Response)'
+    return 'WhatsApp Decryptor OK - v6.0 (Direct Drive Upload, B64 creds)'
 
 
-@app.route('/decrypt-and-return', methods=['POST'])
-def decrypt_and_return():
+@app.route('/decrypt-and-upload', methods=['POST'])
+def decrypt_and_upload():
     try:
         data = request.json
         file_url = data.get('url', '')
         media_key_b64 = data.get('mediaKey', '')
         media_type = data.get('mediaType', 'video')
+        file_name = data.get('fileName', 'video.mp4')
+        folder_id = data.get('folderId', '')
         mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-RETURN v5.1 (binary) ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-UPLOAD v6.0 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
+        print(f"FileName: {file_name}", file=sys.stderr)
+        print(f"FolderID: {folder_id}", file=sys.stderr)
 
         if not file_url:
             return jsonify({'error': 'url is required'}), 400
         if not media_key_b64:
             return jsonify({'error': 'mediaKey is required'}), 400
+        if not folder_id:
+            return jsonify({'error': 'folderId is required'}), 400
 
         # Decode mediaKey
         try:
@@ -91,8 +137,8 @@ def decrypt_and_return():
         if len(media_key_bytes) != 32:
             return jsonify({'error': f'Invalid media key: {len(media_key_bytes)} bytes'}), 400
 
-        # Download
-        print(f"Downloading...", file=sys.stderr)
+        # Step 1: Download
+        print(f"Step 1: Downloading...", file=sys.stderr)
         resp = requests.get(file_url, timeout=300)
         resp.raise_for_status()
         encrypted_data = resp.content
@@ -103,23 +149,28 @@ def decrypt_and_return():
                 'error': f'File too small ({len(encrypted_data)} bytes) - URL may have expired'
             }), 400
 
-        # Decrypt
-        print(f"Decrypting...", file=sys.stderr)
+        # Step 2: Decrypt
+        print(f"Step 2: Decrypting...", file=sys.stderr)
         decrypted = decrypt_media(encrypted_data, media_key_bytes, media_type)
         del encrypted_data
-        print(f"Decrypted {len(decrypted)} bytes, returning raw binary", file=sys.stderr)
+        print(f"Decrypted {len(decrypted)} bytes", file=sys.stderr)
 
-        # Retorna bytes raw
-        return Response(
-            decrypted,
-            mimetype=mime_type,
-            headers={
-                'Content-Disposition': 'attachment',
-                'Content-Length': str(len(decrypted))
-            }
-        )
+        # Step 3: Upload to Drive
+        print(f"Step 3: Uploading to Drive...", file=sys.stderr)
+        drive_file = upload_to_drive(decrypted, file_name, mime_type, folder_id)
+        del decrypted
+        print(f"Done! File ID: {drive_file.get('id')}", file=sys.stderr)
+
+        return jsonify({
+            'success': True,
+            'fileId': drive_file.get('id'),
+            'fileName': drive_file.get('name'),
+            'fileLink': drive_file.get('webViewLink'),
+            'fileSize': drive_file.get('size')
+        })
 
     except requests.exceptions.RequestException as e:
+        print(f"DOWNLOAD ERROR: {str(e)}", file=sys.stderr)
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
     except Exception as e:
         print(f"ERROR: {str(e)}", file=sys.stderr)
