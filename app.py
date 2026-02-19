@@ -13,10 +13,6 @@ import sys
 
 app = Flask(__name__)
 
-# ============================================================
-# WHATSAPP DECRYPTION
-# ============================================================
-
 APP_INFO = {
     "video": b"WhatsApp Video Keys",
     "image": b"WhatsApp Image Keys",
@@ -64,17 +60,26 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     return decrypted
 
 
-# ============================================================
-# GOOGLE DRIVE UPLOAD
-# ============================================================
-
 def get_drive_service():
-    """Create Google Drive service using service account credentials"""
     creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
     if not creds_json:
         raise Exception('GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set')
 
-    creds_dict = json.loads(creds_json)
+    try:
+        creds_dict = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        raise Exception(f'Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON: {str(e)}')
+
+    # Fix escaped newlines in private_key
+    if 'private_key' in creds_dict:
+        pk = creds_dict['private_key']
+        # Handle double-escaped newlines from env vars
+        pk = pk.replace('\\n', '\n')
+        # Ensure it starts and ends properly
+        if not pk.startswith('-----BEGIN'):
+            raise Exception(f'private_key does not start with BEGIN marker. First 50 chars: {pk[:50]}')
+        creds_dict['private_key'] = pk
+
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict,
         scopes=['https://www.googleapis.com/auth/drive.file']
@@ -83,40 +88,27 @@ def get_drive_service():
 
 
 def upload_to_drive(file_data, file_name, mime_type, folder_id):
-    """Upload file directly to Google Drive"""
     service = get_drive_service()
-
     file_metadata = {
         'name': file_name,
         'parents': [folder_id]
     }
-
     media = MediaInMemoryUpload(file_data, mimetype=mime_type, resumable=True)
-
     file = service.files().create(
         body=file_metadata,
         media_body=media,
         fields='id, name, webViewLink, size'
     ).execute()
-
     return file
 
 
-# ============================================================
-# ROUTES
-# ============================================================
-
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v4 (Direct Drive Upload)'
+    return 'WhatsApp Decryptor OK - v4.1 (Direct Drive Upload)'
 
 
 @app.route('/decrypt-and-upload', methods=['POST'])
 def decrypt_and_upload():
-    """
-    Downloads .enc from WhatsApp, decrypts, uploads directly to Google Drive.
-    N8N sends only metadata - no binary data passes through N8N.
-    """
     try:
         data = request.json
         file_url = data.get('url', '')
@@ -126,13 +118,14 @@ def decrypt_and_upload():
         folder_id = data.get('folderId', '')
         mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-UPLOAD v4 ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-UPLOAD v4.1 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
         print(f"FileName: {file_name}", file=sys.stderr)
         print(f"FolderID: {folder_id}", file=sys.stderr)
+        print(f"MediaKey: {media_key_b64}", file=sys.stderr)
+        print(f"MediaKey length: {len(media_key_b64)} chars", file=sys.stderr)
 
-        # Validate inputs
         if not file_url:
             return jsonify({'error': 'url is required'}), 400
         if not media_key_b64:
@@ -140,34 +133,49 @@ def decrypt_and_upload():
         if not folder_id:
             return jsonify({'error': 'folderId is required'}), 400
 
-        media_key_bytes = base64.b64decode(media_key_b64)
-        if len(media_key_bytes) != 32:
-            return jsonify({'error': f'Invalid media key length: {len(media_key_bytes)}'}), 400
+        # Decode mediaKey with padding fix
+        try:
+            missing_padding = 4 - len(media_key_b64) % 4
+            if missing_padding != 4:
+                media_key_b64 = media_key_b64 + '=' * missing_padding
+            media_key_bytes = base64.b64decode(media_key_b64)
+        except Exception as e:
+            return jsonify({
+                'error': f'mediaKey decode failed: {str(e)}',
+                'mediaKey_received': media_key_b64,
+                'mediaKey_length': len(media_key_b64)
+            }), 400
 
-        # Step 1: Download encrypted file from WhatsApp CDN
-        print(f"Step 1: Downloading from WhatsApp CDN...", file=sys.stderr)
+        if len(media_key_bytes) != 32:
+            return jsonify({'error': f'Invalid media key: {len(media_key_bytes)} bytes (expected 32)'}), 400
+
+        # Step 1: Download
+        print(f"Step 1: Downloading...", file=sys.stderr)
         resp = requests.get(file_url, timeout=300)
         resp.raise_for_status()
         encrypted_data = resp.content
         print(f"Downloaded {len(encrypted_data)} bytes", file=sys.stderr)
 
         if len(encrypted_data) < 11:
-            return jsonify({'error': f'Downloaded file too small: {len(encrypted_data)} bytes'}), 400
+            return jsonify({'error': f'File too small: {len(encrypted_data)} bytes'}), 400
 
         # Step 2: Decrypt
         print(f"Step 2: Decrypting...", file=sys.stderr)
         decrypted = decrypt_media(encrypted_data, media_key_bytes, media_type)
         print(f"Decrypted {len(decrypted)} bytes", file=sys.stderr)
-
-        # Free encrypted data from memory
         del encrypted_data
 
-        # Step 3: Upload to Google Drive
-        print(f"Step 3: Uploading to Google Drive...", file=sys.stderr)
-        drive_file = upload_to_drive(decrypted, file_name, mime_type, folder_id)
-        print(f"Uploaded! File ID: {drive_file.get('id')}", file=sys.stderr)
+        # Step 3: Upload
+        print(f"Step 3: Uploading to Drive...", file=sys.stderr)
+        try:
+            drive_file = upload_to_drive(decrypted, file_name, mime_type, folder_id)
+        except Exception as e:
+            print(f"DRIVE ERROR: {str(e)}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return jsonify({'error': f'Drive upload failed: {str(e)}'}), 500
 
-        # Free decrypted data from memory
+        print(f"Done! File ID: {drive_file.get('id')}", file=sys.stderr)
         del decrypted
 
         return jsonify({
@@ -180,7 +188,7 @@ def decrypt_and_upload():
 
     except requests.exceptions.RequestException as e:
         print(f"DOWNLOAD ERROR: {str(e)}", file=sys.stderr)
-        return jsonify({'error': f'Failed to download: {str(e)}'}), 500
+        return jsonify({'error': f'Download failed: {str(e)}'}), 500
     except Exception as e:
         print(f"ERROR: {str(e)}", file=sys.stderr)
         import traceback
