@@ -7,9 +7,12 @@ import base64
 import hashlib
 import hmac as hmac_module
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import os
 import sys
+import io
 
 app = Flask(__name__)
 
@@ -60,6 +63,30 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     return decrypted
 
 
+def download_with_retry(url, max_retries=3):
+    """Download com retry automatico e streaming"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=max_retries,
+        backoff_factor=2,
+        status_forcelist=[500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    resp = session.get(url, timeout=600, stream=True)
+    resp.raise_for_status()
+
+    # Le em chunks pra evitar corte de conexao
+    chunks = []
+    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            chunks.append(chunk)
+
+    return b''.join(chunks)
+
+
 def get_drive_service():
     creds_b64 = os.environ.get('GOOGLE_SERVICE_ACCOUNT_B64', '')
     if creds_b64:
@@ -99,7 +126,7 @@ def upload_to_drive(file_data, file_name, mime_type, folder_id):
 
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v6.0 (Direct Drive Upload, B64 creds)'
+    return 'WhatsApp Decryptor OK - v7.0 (Retry + Streaming)'
 
 
 @app.route('/decrypt-and-upload', methods=['POST'])
@@ -113,7 +140,7 @@ def decrypt_and_upload():
         folder_id = data.get('folderId', '')
         mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-UPLOAD v6.0 ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-UPLOAD v7.0 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
         print(f"FileName: {file_name}", file=sys.stderr)
@@ -138,11 +165,9 @@ def decrypt_and_upload():
         if len(media_key_bytes) != 32:
             return jsonify({'error': f'Invalid media key: {len(media_key_bytes)} bytes'}), 400
 
-        # Step 1: Download
-        print(f"Step 1: Downloading...", file=sys.stderr)
-        resp = requests.get(file_url, timeout=300)
-        resp.raise_for_status()
-        encrypted_data = resp.content
+        # Step 1: Download com retry
+        print(f"Step 1: Downloading (with retry)...", file=sys.stderr)
+        encrypted_data = download_with_retry(file_url)
         print(f"Downloaded {len(encrypted_data)} bytes", file=sys.stderr)
 
         if len(encrypted_data) < 100:
@@ -180,6 +205,30 @@ def decrypt_and_upload():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/test-drive', methods=['GET'])
+def test_drive():
+    try:
+        folder_id = request.args.get('folder', '1khgyT1zsLiBJH1QxoMuhF1yjc66Jq8jf')
+        service = get_drive_service()
+        folder = service.files().get(
+            fileId=folder_id,
+            supportsAllDrives=True,
+            fields='id, name, mimeType'
+        ).execute()
+        return jsonify({'success': True, 'folder': folder})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
+```
+
+O `requirements.txt` mantém igual:
+```
+flask
+pycryptodome
+requests
+google-auth
+google-api-python-client
