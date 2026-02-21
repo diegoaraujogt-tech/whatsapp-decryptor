@@ -54,7 +54,15 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     media_key_expanded = hkdf_expand(media_key_bytes, 112, info)
     iv = media_key_expanded[:16]
     cipher_key = media_key_expanded[16:48]
+    
+    # Remove MAC (ultimos 10 bytes)
     file_data = encrypted_data[:-10]
+    
+    # Garante multiplo de 16 bytes pro AES CBC
+    remainder = len(file_data) % 16
+    if remainder != 0:
+        file_data = file_data[:-(remainder)]
+    
     cipher = AES.new(cipher_key, AES.MODE_CBC, iv)
     decrypted = cipher.decrypt(file_data)
     decrypted = aes_unpad(decrypted)
