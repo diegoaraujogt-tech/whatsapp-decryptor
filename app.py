@@ -223,12 +223,3 @@ def test_drive():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
-```
-
-O `requirements.txt` mantém igual:
-```
-flask
-pycryptodome
-requests
-google-auth
-google-api-python-client
