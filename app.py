@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseUpload
 import base64
 import hashlib
 import hmac as hmac_module
@@ -11,6 +11,9 @@ import json
 import os
 import sys
 import time
+import io
+import subprocess
+import tempfile
 
 app = Flask(__name__)
 
@@ -54,77 +57,78 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     media_key_expanded = hkdf_expand(media_key_bytes, 112, info)
     iv = media_key_expanded[:16]
     cipher_key = media_key_expanded[16:48]
-    
+
     # Remove MAC (ultimos 10 bytes)
     file_data = encrypted_data[:-10]
-    
+
     # Garante multiplo de 16 bytes pro AES CBC
     remainder = len(file_data) % 16
     if remainder != 0:
         file_data = file_data[:-(remainder)]
-    
+
     cipher = AES.new(cipher_key, AES.MODE_CBC, iv)
     decrypted = cipher.decrypt(file_data)
     decrypted = aes_unpad(decrypted)
     return decrypted
 
 
-def download_with_resume(url, max_retries=10):
-    """Download com resume automatico - baixa em pedacos e retoma se cair"""
-    downloaded = b''
-    attempt = 0
-
-    while attempt < max_retries:
+def download_file(url, max_retries=5):
+    """Download usando curl - mais robusto que requests pra arquivos grandes"""
+    for attempt in range(max_retries):
         try:
-            headers = {}
-            if len(downloaded) > 0:
-                headers['Range'] = f'bytes={len(downloaded)}-'
-                print(f"  Resuming from byte {len(downloaded)}...", file=sys.stderr)
+            print(f"  Download attempt {attempt + 1}/{max_retries}...", file=sys.stderr)
 
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=120,
-                stream=True
+            # Usa curl que e muito mais robusto pra downloads grandes
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.enc')
+            tmp.close()
+
+            result = subprocess.run(
+                [
+                    'curl', '-L', '-f', '-s',
+                    '--retry', '3',
+                    '--retry-delay', '5',
+                    '--connect-timeout', '30',
+                    '--max-time', '900',
+                    '-o', tmp.name,
+                    url
+                ],
+                capture_output=True,
+                timeout=960
             )
 
-            if resp.status_code == 416:
-                print(f"  Download complete (416 Range Not Satisfiable)", file=sys.stderr)
-                break
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8', errors='replace')
+                print(f"  curl failed (code {result.returncode}): {error_msg[:100]}", file=sys.stderr)
+                os.unlink(tmp.name)
+                if attempt < max_retries - 1:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                raise Exception(f"curl failed after {max_retries} attempts: {error_msg[:200]}")
 
-            resp.raise_for_status()
+            file_size = os.path.getsize(tmp.name)
+            print(f"  Downloaded {file_size} bytes ({file_size / 1024 / 1024:.1f} MB)", file=sys.stderr)
 
-            for chunk in resp.iter_content(chunk_size=512 * 1024):
-                if chunk:
-                    downloaded += chunk
+            if file_size < 100:
+                os.unlink(tmp.name)
+                raise Exception(f"File too small ({file_size} bytes) - URL may have expired")
 
-            content_length = resp.headers.get('Content-Length')
-            if content_length and resp.status_code == 200:
-                expected = int(content_length)
-                if len(downloaded) >= expected:
-                    print(f"  Download complete: {len(downloaded)} bytes", file=sys.stderr)
-                    break
-            else:
-                print(f"  Chunk done: {len(downloaded)} bytes total", file=sys.stderr)
-                break
+            with open(tmp.name, 'rb') as f:
+                data = f.read()
+            os.unlink(tmp.name)
+            return data
 
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.Timeout) as e:
-            attempt += 1
-            wait = min(attempt * 3, 15)
-            print(f"  Connection error (attempt {attempt}/{max_retries}): {str(e)[:80]}", file=sys.stderr)
-            print(f"  Got {len(downloaded)} bytes so far. Waiting {wait}s...", file=sys.stderr)
-            time.sleep(wait)
-            continue
+        except subprocess.TimeoutExpired:
+            print(f"  Timeout on attempt {attempt + 1}", file=sys.stderr)
+            try:
+                os.unlink(tmp.name)
+            except:
+                pass
+            if attempt < max_retries - 1:
+                time.sleep(5)
+                continue
+            raise Exception("Download timed out after all retries")
 
-        except Exception as e:
-            raise Exception(f"Download failed: {str(e)}")
-
-    if attempt >= max_retries and len(downloaded) < 100:
-        raise Exception(f"Download failed after {max_retries} retries. Got {len(downloaded)} bytes.")
-
-    return downloaded
+    raise Exception("Download failed after all retries")
 
 
 def get_drive_service():
@@ -154,7 +158,12 @@ def upload_to_drive(file_data, file_name, mime_type, folder_id):
         'name': file_name,
         'parents': [folder_id]
     }
-    media = MediaInMemoryUpload(file_data, mimetype=mime_type, resumable=True)
+    media = MediaIoBaseUpload(
+        io.BytesIO(file_data),
+        mimetype=mime_type,
+        resumable=True,
+        chunksize=10 * 1024 * 1024
+    )
     file = service.files().create(
         body=file_metadata,
         media_body=media,
@@ -166,7 +175,7 @@ def upload_to_drive(file_data, file_name, mime_type, folder_id):
 
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v8.0 (Resume Download + 500MB support)'
+    return 'WhatsApp Decryptor OK - v9.0 (curl download + chunked upload)'
 
 
 @app.route('/decrypt-and-upload', methods=['POST'])
@@ -180,7 +189,7 @@ def decrypt_and_upload():
         folder_id = data.get('folderId', '')
         mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-UPLOAD v8.0 ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-UPLOAD v9.0 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
         print(f"FileName: {file_name}", file=sys.stderr)
@@ -205,15 +214,10 @@ def decrypt_and_upload():
         if len(media_key_bytes) != 32:
             return jsonify({'error': f'Invalid media key: {len(media_key_bytes)} bytes'}), 400
 
-        # Step 1: Download com resume
-        print(f"Step 1: Downloading (with resume)...", file=sys.stderr)
-        encrypted_data = download_with_resume(file_url)
+        # Step 1: Download com curl
+        print(f"Step 1: Downloading with curl...", file=sys.stderr)
+        encrypted_data = download_file(file_url)
         print(f"Downloaded {len(encrypted_data)} bytes ({len(encrypted_data) / 1024 / 1024:.1f} MB)", file=sys.stderr)
-
-        if len(encrypted_data) < 100:
-            return jsonify({
-                'error': f'File too small ({len(encrypted_data)} bytes) - URL may have expired'
-            }), 400
 
         # Step 2: Decrypt
         print(f"Step 2: Decrypting...", file=sys.stderr)
