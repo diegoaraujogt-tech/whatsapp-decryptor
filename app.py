@@ -7,12 +7,10 @@ import base64
 import hashlib
 import hmac as hmac_module
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import json
 import os
 import sys
-import io
+import time
 
 app = Flask(__name__)
 
@@ -63,28 +61,62 @@ def decrypt_media(encrypted_data, media_key_bytes, media_type="video"):
     return decrypted
 
 
-def download_with_retry(url, max_retries=3):
-    """Download com retry automatico e streaming"""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=max_retries,
-        backoff_factor=2,
-        status_forcelist=[500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+def download_with_resume(url, max_retries=10):
+    """Download com resume automatico - baixa em pedacos e retoma se cair"""
+    downloaded = b''
+    attempt = 0
 
-    resp = session.get(url, timeout=600, stream=True)
-    resp.raise_for_status()
+    while attempt < max_retries:
+        try:
+            headers = {}
+            if len(downloaded) > 0:
+                headers['Range'] = f'bytes={len(downloaded)}-'
+                print(f"  Resuming from byte {len(downloaded)}...", file=sys.stderr)
 
-    # Le em chunks pra evitar corte de conexao
-    chunks = []
-    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-        if chunk:
-            chunks.append(chunk)
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=120,
+                stream=True
+            )
 
-    return b''.join(chunks)
+            if resp.status_code == 416:
+                print(f"  Download complete (416 Range Not Satisfiable)", file=sys.stderr)
+                break
+
+            resp.raise_for_status()
+
+            for chunk in resp.iter_content(chunk_size=512 * 1024):
+                if chunk:
+                    downloaded += chunk
+
+            content_length = resp.headers.get('Content-Length')
+            if content_length and resp.status_code == 200:
+                expected = int(content_length)
+                if len(downloaded) >= expected:
+                    print(f"  Download complete: {len(downloaded)} bytes", file=sys.stderr)
+                    break
+            else:
+                print(f"  Chunk done: {len(downloaded)} bytes total", file=sys.stderr)
+                break
+
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.Timeout) as e:
+            attempt += 1
+            wait = min(attempt * 3, 15)
+            print(f"  Connection error (attempt {attempt}/{max_retries}): {str(e)[:80]}", file=sys.stderr)
+            print(f"  Got {len(downloaded)} bytes so far. Waiting {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+            continue
+
+        except Exception as e:
+            raise Exception(f"Download failed: {str(e)}")
+
+    if attempt >= max_retries and len(downloaded) < 100:
+        raise Exception(f"Download failed after {max_retries} retries. Got {len(downloaded)} bytes.")
+
+    return downloaded
 
 
 def get_drive_service():
@@ -126,7 +158,7 @@ def upload_to_drive(file_data, file_name, mime_type, folder_id):
 
 @app.route('/')
 def home():
-    return 'WhatsApp Decryptor OK - v7.0 (Retry + Streaming)'
+    return 'WhatsApp Decryptor OK - v8.0 (Resume Download + 500MB support)'
 
 
 @app.route('/decrypt-and-upload', methods=['POST'])
@@ -140,7 +172,7 @@ def decrypt_and_upload():
         folder_id = data.get('folderId', '')
         mime_type = data.get('mimeType', 'video/mp4')
 
-        print(f"=== DECRYPT-AND-UPLOAD v7.0 ===", file=sys.stderr)
+        print(f"=== DECRYPT-AND-UPLOAD v8.0 ===", file=sys.stderr)
         print(f"URL: {file_url[:80]}...", file=sys.stderr)
         print(f"MediaType: {media_type}", file=sys.stderr)
         print(f"FileName: {file_name}", file=sys.stderr)
@@ -165,10 +197,10 @@ def decrypt_and_upload():
         if len(media_key_bytes) != 32:
             return jsonify({'error': f'Invalid media key: {len(media_key_bytes)} bytes'}), 400
 
-        # Step 1: Download com retry
-        print(f"Step 1: Downloading (with retry)...", file=sys.stderr)
-        encrypted_data = download_with_retry(file_url)
-        print(f"Downloaded {len(encrypted_data)} bytes", file=sys.stderr)
+        # Step 1: Download com resume
+        print(f"Step 1: Downloading (with resume)...", file=sys.stderr)
+        encrypted_data = download_with_resume(file_url)
+        print(f"Downloaded {len(encrypted_data)} bytes ({len(encrypted_data) / 1024 / 1024:.1f} MB)", file=sys.stderr)
 
         if len(encrypted_data) < 100:
             return jsonify({
@@ -179,7 +211,7 @@ def decrypt_and_upload():
         print(f"Step 2: Decrypting...", file=sys.stderr)
         decrypted = decrypt_media(encrypted_data, media_key_bytes, media_type)
         del encrypted_data
-        print(f"Decrypted {len(decrypted)} bytes", file=sys.stderr)
+        print(f"Decrypted {len(decrypted)} bytes ({len(decrypted) / 1024 / 1024:.1f} MB)", file=sys.stderr)
 
         # Step 3: Upload to Drive
         print(f"Step 3: Uploading to Drive...", file=sys.stderr)
@@ -195,9 +227,6 @@ def decrypt_and_upload():
             'fileSize': drive_file.get('size')
         })
 
-    except requests.exceptions.RequestException as e:
-        print(f"DOWNLOAD ERROR: {str(e)}", file=sys.stderr)
-        return jsonify({'error': f'Download failed: {str(e)}'}), 500
     except Exception as e:
         print(f"ERROR: {str(e)}", file=sys.stderr)
         import traceback
